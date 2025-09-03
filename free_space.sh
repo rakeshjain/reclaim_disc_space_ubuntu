@@ -4,134 +4,186 @@
 
 set -e
 
+# Color and helper functions for user-friendly output
+if [ -t 1 ]; then
+  BOLD="\e[1m"; RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; BLUE="\e[34m"; RESET="\e[0m"
+else
+  BOLD=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; RESET=""
+fi
+
+info() { echo -e "${BLUE}[INFO]${RESET} $*"; }
+step() { echo -e "${YELLOW}👉 ${BOLD}$*${RESET}"; }
+success() { echo -e "${GREEN}[DONE]${RESET} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+error() { echo -e "${RED}[ERROR]${RESET} $*"; }
+
+prompt_yes_no() {
+  local prompt="${1:-Proceed?} [y/N]: "
+  local answer
+  while true; do
+    read -r -p "$prompt" answer
+    case "$answer" in
+      [yY]|[yY][eE][sS]) return 0 ;;
+      [nN]|[nN][oO]|"") return 1 ;;
+      *) echo "Please answer y or n." ;;
+    esac
+  done
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Safely set or append a key=value in a config file
+set_conf_value() {
+  local file="$1" key="$2" val="$3"
+  if grep -qE "^[#]*${key}=" "$file"; then
+    sudo sed -i "s|^[#]*${key}=.*|${key}=${val}|" "$file"
+  else
+    echo "${key}=${val}" | sudo tee -a "$file" >/dev/null
+  fi
+}
+
 CONF_FILE="/etc/systemd/journald.conf"
 
-echo "=============================="
-echo "   Ubuntu Disk Manager Tool"
-echo "=============================="
+
+# Banner
+echo -e "${BOLD}==============================${RESET}"
+echo -e "${BOLD}   Ubuntu Disk Manager Tool   ${RESET}"
+echo -e "${BOLD}==============================${RESET}"
+echo
+warn "This script makes system-level changes. Proceed with caution."
+warn "You are solely responsible for any damage or data loss."
+if ! prompt_yes_no "Do you understand and accept the risks?"; then
+  info "Exiting without making changes."
+  exit 0
+fi
 echo
 
 # Show current usage
-echo "[INFO] Current disk usage:"
+info "Current disk usage:"
 df -h
 echo
+# Capture available space on root filesystem before cleanup (in bytes)
+AVAIL_BEFORE=$(df --output=avail -B1 / 2>/dev/null | tail -1 | tr -d ' ')
+bytes_to_human() { numfmt --to=iec --suffix=B --format="%.1f" "$1" 2>/dev/null || echo "$1 bytes"; }
 
 # 1. Clean apt cache
-echo "👉 Step 1: Clean apt cache"
-echo "This removes cached .deb package files that are safe to delete."
-echo "It will NOT remove installed software."
-read -p "Do you want to clean apt cache? (y/n): " choice
-if [[ $choice == "y" ]]; then
+step "Step 1: Clean apt cache"
+info "Removes cached .deb package files that are safe to delete. Does NOT remove installed software."
+if prompt_yes_no "Clean apt cache now?"; then
   sudo apt-get clean
   sudo apt-get autoclean
-  echo "[DONE] Apt cache cleaned."
+  success "Apt cache cleaned."
 fi
 echo
 
 # 2. Remove unused packages
-echo "👉 Step 2: Remove unused packages"
-echo "This removes old libraries and software automatically installed"
-echo "but no longer required by any package."
-read -p "Do you want to remove unused packages? (y/n): " choice
-if [[ $choice == "y" ]]; then
+step "Step 2: Remove unused packages"
+info "Removes libraries/software automatically installed but no longer required by any package."
+if prompt_yes_no "Remove unused packages now?"; then
   sudo apt-get autoremove -y
-  echo "[DONE] Unused packages removed."
+  success "Unused packages removed."
 fi
 echo
 
 # 3. Clean system logs
-echo "👉 Step 3: Clean system logs"
-echo "This deletes logs older than 7 days and compressed old logs."
-echo "Useful if /var/log is using too much space."
-read -p "Do you want to clean old logs? (y/n): " choice
-if [[ $choice == "y" ]]; then
-  sudo journalctl --vacuum-time=7d
+step "Step 3: Clean system logs"
+info "Deletes logs older than 7 days and compressed old logs. Useful if /var/log is large."
+if prompt_yes_no "Clean old logs now?"; then
+  if have_cmd journalctl; then
+    sudo journalctl --vacuum-time=7d
+  else
+    warn "journalctl not found; skipping journald vacuum."
+  fi
   sudo rm -f /var/log/*.gz /var/log/*.[0-9] 2>/dev/null || true
-  echo "[DONE] Old logs removed."
+  success "Old logs removed."
 fi
 echo
 
 # 4. Remove old kernels
-echo "👉 Step 4: Remove old kernels"
-echo "This deletes old Linux kernel versions but keeps the current"
-echo "and the previous one for safety."
-read -p "Do you want to purge old kernels? (y/n): " choice
-if [[ $choice == "y" ]]; then
+step "Step 4: Remove old kernels"
+info "Deletes old Linux kernel versions while keeping the current (and typically previous) one."
+info "Current kernel: $(uname -r)"
+if prompt_yes_no "Purge old kernels now?"; then
   sudo apt-get autoremove --purge -y
-  echo "[DONE] Old kernels purged."
+  success "Old kernels purged."
 fi
 echo
 
 # 5. Clean old snap versions
-echo "👉 Step 5: Clean old snap versions"
-echo "Snap keeps multiple revisions of applications, wasting space."
-echo "This will remove disabled (old) versions but keep current ones."
-read -p "Do you want to remove old snap versions? (y/n): " choice
-if [[ $choice == "y" ]]; then
-  LANG=C snap list --all | awk '/disabled/{print $1, $3}' |
-  while read snapname revision; do
-    sudo snap remove "$snapname" --revision="$revision"
-  done
-  echo "[DONE] Old snap versions removed."
+step "Step 5: Clean old snap versions"
+info "Snap keeps multiple revisions of apps. This removes disabled (old) revisions, keeping current ones."
+if have_cmd snap; then
+  if prompt_yes_no "Remove old snap revisions now?"; then
+    LANG=C snap list --all | awk '/disabled/{print $1, $3}' |
+    while read -r snapname revision; do
+      sudo snap remove "$snapname" --revision="$revision"
+    done
+    success "Old snap versions removed."
+  fi
+else
+  warn "snap is not installed; skipping snap cleanup."
 fi
 echo
 
 # 6. Show top 20 biggest files
-echo "👉 Step 6: Identify large files"
-echo "This will scan your system and list the 20 largest files over 100MB."
-echo "You can then decide manually if you want to delete them."
-read -p "Do you want to list top 20 biggest files? (y/n): " choice
-if [[ $choice == "y" ]]; then
+step "Step 6: Identify large files"
+info "Scans and lists the 20 largest files over 100MB. No files are deleted automatically."
+if prompt_yes_no "List top 20 largest files now?"; then
   sudo find / -type f -size +100M -exec du -h {} + 2>/dev/null | sort -hr | head -20
-  echo "[INFO] Review above files manually before deleting."
+  info "Review the files above manually before deleting."
 fi
 echo
 
 # 7. Configure journald log size
-echo "👉 Step 7: Configure journald log size"
-echo "System logs are stored by systemd-journald. By default, they can grow large."
-echo "Here you can set permanent size limits for logs."
-read -p "Do you want to configure journald log size limits? (y/n): " choice
-if [[ $choice == "y" ]]; then
-  echo
-  echo "[INFO] Current journald.conf values:"
-  grep -E "SystemMaxUse|SystemKeepFree|SystemMaxFileSize|SystemMaxFiles" $CONF_FILE | grep -v '^#' || echo "(none set, defaults in use)"
-  echo
+step "Step 7: Configure journald log size"
+info "System logs are stored by systemd-journald and can grow large. Set persistent size limits here."
+if prompt_yes_no "Configure journald log size limits now?"; then
+  if [ ! -f "$CONF_FILE" ]; then
+    warn "Config file $CONF_FILE not found. Skipping journald configuration."
+  else
+    echo
+    info "Current journald.conf values:"
+    grep -E "^(SystemMaxUse|SystemKeepFree|SystemMaxFileSize|SystemMaxFiles)=" "$CONF_FILE" || echo "(none set, defaults in use)"
+    echo
 
-  # Ask new settings
-  read -p "Enter new SystemMaxUse value (e.g., 500M, 1G, leave blank to skip): " MAX_USE
-  read -p "Enter new SystemKeepFree value (e.g., 100M, leave blank to skip): " KEEP_FREE
-  read -p "Enter new SystemMaxFileSize value (e.g., 50M, leave blank to skip): " MAX_FILE
-  read -p "Enter new SystemMaxFiles value (e.g., 10, leave blank to skip): " MAX_FILES
-  echo
+    # Ask new settings
+    read -r -p "Enter new SystemMaxUse value (e.g., 500M, 1G, leave blank to skip): " MAX_USE
+    read -r -p "Enter new SystemKeepFree value (e.g., 100M, leave blank to skip): " KEEP_FREE
+    read -r -p "Enter new SystemMaxFileSize value (e.g., 50M, leave blank to skip): " MAX_FILE
+    read -r -p "Enter new SystemMaxFiles value (e.g., 10, leave blank to skip): " MAX_FILES
+    echo
 
-  # Backup config
-  sudo cp $CONF_FILE ${CONF_FILE}.bak.$(date +%F-%T)
-  echo "[INFO] Backup saved as ${CONF_FILE}.bak.$(date +%F-%T)"
+    # Backup config
+    BACKUP_PATH="${CONF_FILE}.bak.$(date +%F-%T)"
+    sudo cp "$CONF_FILE" "$BACKUP_PATH"
+    info "Backup saved as $BACKUP_PATH"
 
-  # Apply new values
-  if [[ -n "$MAX_USE" ]]; then
-    sudo sed -i "s/^#*SystemMaxUse=.*/SystemMaxUse=$MAX_USE/" $CONF_FILE || echo "SystemMaxUse=$MAX_USE" | sudo tee -a $CONF_FILE
-  fi
-  if [[ -n "$KEEP_FREE" ]]; then
-    sudo sed -i "s/^#*SystemKeepFree=.*/SystemKeepFree=$KEEP_FREE/" $CONF_FILE || echo "SystemKeepFree=$KEEP_FREE" | sudo tee -a $CONF_FILE
-  fi
-  if [[ -n "$MAX_FILE" ]]; then
-    sudo sed -i "s/^#*SystemMaxFileSize=.*/SystemMaxFileSize=$MAX_FILE/" $CONF_FILE || echo "SystemMaxFileSize=$MAX_FILE" | sudo tee -a $CONF_FILE
-  fi
-  if [[ -n "$MAX_FILES" ]]; then
-    sudo sed -i "s/^#*SystemMaxFiles=.*/SystemMaxFiles=$MAX_FILES/" $CONF_FILE || echo "SystemMaxFiles=$MAX_FILES" | sudo tee -a $CONF_FILE
-  fi
+    # Apply new values
+    if [[ -n "$MAX_USE" ]]; then set_conf_value "$CONF_FILE" SystemMaxUse "$MAX_USE"; fi
+    if [[ -n "$KEEP_FREE" ]]; then set_conf_value "$CONF_FILE" SystemKeepFree "$KEEP_FREE"; fi
+    if [[ -n "$MAX_FILE" ]]; then set_conf_value "$CONF_FILE" SystemMaxFileSize "$MAX_FILE"; fi
+    if [[ -n "$MAX_FILES" ]]; then set_conf_value "$CONF_FILE" SystemMaxFiles "$MAX_FILES"; fi
 
-  echo
-  echo "[INFO] Restarting systemd-journald service..."
-  sudo systemctl restart systemd-journald
-  echo "[DONE] Journald limits updated."
+    echo
+    info "Restarting systemd-journald service..."
+    sudo systemctl restart systemd-journald
+    success "Journald limits updated."
+  fi
 fi
 echo
 
 # Final usage
-echo "[INFO] Disk usage after cleanup:"
+info "Disk usage after cleanup:"
 df -h
+echo
+AVAIL_AFTER=$(df --output=avail -B1 / 2>/dev/null | tail -1 | tr -d ' ')
+if [[ -n "$AVAIL_BEFORE" && -n "$AVAIL_AFTER" ]]; then
+  DELTA=$(( AVAIL_AFTER - AVAIL_BEFORE ))
+  if (( DELTA >= 0 )); then
+    success "Approx. space reclaimed: $(bytes_to_human "$DELTA")"
+  else
+    warn "Available space decreased by: $(bytes_to_human "$(( -DELTA ))")"
+  fi
+fi
 echo
 echo "🎉 Disk management complete!"
